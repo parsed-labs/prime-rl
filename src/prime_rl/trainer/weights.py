@@ -24,7 +24,7 @@ from prime_rl.trainer.lora import (
     restore_lora_weights_inplace,
     save_lora_config,
 )
-from prime_rl.trainer.rl.config import WeightCheckpointConfig
+from prime_rl.trainer.config import WeightCheckpointConfig
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.utils import get_step_path, get_weight_ckpt_model_path, get_weights_dir
