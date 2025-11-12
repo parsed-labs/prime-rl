@@ -67,6 +67,13 @@ class SFTDataConfig(BaseDataConfig):
         ),
     ] = 0
 
+    format: Annotated[
+        Literal["prompt_completion", "messages", "text"],
+        Field(
+            description="Format of the dataset. 'prompt_completion' expects 'prompt' and 'completion' columns with message lists. 'messages' expects a single 'messages' column with all messages. 'text' expects a single 'text' column with pre-formatted text (already has chat template applied)."
+        ),
+    ] = "prompt_completion"
+
     # Configuring
     loss_mask: LossMaskConfig = LossMaskConfig()
 

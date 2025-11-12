@@ -1,5 +1,5 @@
 max_steps = 100
-output_dir = "/path/to/outputs/qwen3-4b-lora32"
+output_dir = "outputs/qwen3-4b-lora32"
 
 [model]
 name = "Qwen/Qwen3-4B"
@@ -14,6 +14,7 @@ rank = 32
 name = "parsed/sayvant-final"
 batch_size = 8
 seq_len = 16384
+format = "text"
 
 [optim]
 lr = 2e-4

@@ -107,7 +107,7 @@ class FakeDataset(StatefulIterableDataset):
 
 
 class SFTDataset(StatefulIterableDataset):
-    """A dataset wrapping a HF SFT dataset with prompt + completion format."""
+    """A dataset wrapping a HF SFT dataset with prompt + completion format, messages format, or text format."""
 
     def __init__(
         self,
@@ -120,6 +120,7 @@ class SFTDataset(StatefulIterableDataset):
         loss_mask_config: LossMaskConfig = LossMaskConfig(),
         max_examples: int | None = None,
         max_epochs: int | None = None,
+        format: Literal["prompt_completion", "messages", "text"] = "prompt_completion",
     ):
         super().__init__()
         self.logger = get_logger()
@@ -132,6 +133,7 @@ class SFTDataset(StatefulIterableDataset):
         self.loss_mask_config = loss_mask_config
         self.max_examples = max_examples
         self.max_epochs = max_epochs
+        self.format = format
 
         if self.tokenizer is None:
             self.logger.warning("No tokenizer provided, will not process examples")
@@ -151,14 +153,162 @@ class SFTDataset(StatefulIterableDataset):
         self.data_rank = get_world().rank // non_dp_size * num_workers + worker_id
         self.data_world_size = get_world().world_size // non_dp_size * num_workers
 
+    def _create_loss_mask_from_text(self, text: str, input_ids: list[int]) -> list[bool]:
+        """
+        Create a loss mask for pre-formatted text by identifying assistant responses.
+        This is a simplified approach that masks based on chat template markers.
+        """
+        # For text format, we'll use a simple heuristic:
+        # Find assistant response regions in the text and mask everything else
+
+        # Common chat template markers for assistant responses
+        assistant_markers = [
+            "<|im_start|>assistant",
+            "<|start_header_id|>assistant<|end_header_id|>",
+            "<|assistant|>",
+            "[INST]",  # For some formats, response follows [INST]
+        ]
+
+        end_markers = [
+            "<|im_end|>",
+            "<|eot_id|>",
+            "<|end|>",
+        ]
+
+        # Initialize loss mask - by default, mask everything (False means no loss)
+        loss_mask = [False] * len(input_ids)
+
+        # Find assistant response regions in the original text
+        assistant_regions = []
+        for assistant_marker in assistant_markers:
+            start_idx = 0
+            while True:
+                assistant_start = text.find(assistant_marker, start_idx)
+                if assistant_start == -1:
+                    break
+
+                # Find the end of this assistant response
+                assistant_content_start = assistant_start + len(assistant_marker)
+                assistant_end = len(text)
+
+                for end_marker in end_markers:
+                    end_idx = text.find(end_marker, assistant_content_start)
+                    if end_idx != -1 and end_idx < assistant_end:
+                        assistant_end = end_idx
+
+                # Store the character range for this assistant response
+                assistant_regions.append((assistant_content_start, assistant_end))
+                start_idx = assistant_end
+
+        if not assistant_regions:
+            # If no assistant markers found, apply loss to all tokens based on config
+            # Default to training on everything if we can't identify assistant regions
+            if self.loss_mask_config.assistant:
+                loss_mask = [True] * len(input_ids)
+            return loss_mask
+
+        # Now map character positions to token positions
+        # This is approximate since we don't have perfect char-to-token mapping
+        for char_start, char_end in assistant_regions:
+            # Rough estimate: encode substrings to find approximate token boundaries
+            prefix_tokens = len(self.tokenizer.encode(text[:char_start], add_special_tokens=False))
+            response_tokens = len(self.tokenizer.encode(text[char_start:char_end], add_special_tokens=False))
+
+            # Mark these tokens for training
+            token_start = min(prefix_tokens, len(loss_mask))
+            token_end = min(prefix_tokens + response_tokens, len(loss_mask))
+
+            for i in range(token_start, token_end):
+                if self.loss_mask_config.assistant:
+                    loss_mask[i] = True
+
+        return loss_mask
+
     def _process(self, example: dict) -> dict | None:
         # Skip processing if no tokenizer was provided
         if self.tokenizer is None:
             return example
 
-        # Assert that the example has a 'prompt' and 'completion' column
-        if "prompt" not in example or "completion" not in example:
-            raise ValueError("All examples in the dataset must have a 'prompt' and 'completion' column for SFT")
+        # Handle different dataset formats
+        if self.format == "text":
+            # For pre-formatted text, just tokenize directly
+            if "text" not in example:
+                raise ValueError("All examples in the dataset must have a 'text' column for SFT with format='text'")
+
+            text = example["text"]
+
+            # Tokenize the text directly (it already has chat template applied)
+            input_ids = cast(list[int], self.tokenizer.encode(text, add_special_tokens=False))
+
+            # If EOS token is not found, manually append it
+            if self.tokenizer.eos_token_id not in input_ids:
+                self.logger.warning(
+                    f"Did not find EOS token ID {self.tokenizer.eos_token_id} in input_ids. Manually appending EOS token..."
+                )
+                input_ids.append(cast(int, self.tokenizer.eos_token_id))
+
+            # For text format, we need to create a loss mask
+            # Parse the text to find assistant responses
+            # We'll mask everything except assistant responses
+            loss_mask = self._create_loss_mask_from_text(text, input_ids)
+
+            # Prepare inputs
+            target_ids = input_ids.copy()[1:]
+            loss_mask = loss_mask[1:]
+            input_ids = input_ids[:-1]
+
+            if sum(loss_mask[: self.seq_len]) == 0:
+                self.logger.warning(
+                    f"Skipping example {example.get('__index', '')} because no trainable tokens were found within the context window ({self.seq_len}). This is to prevent NaN loss."
+                )
+                return None
+
+            assert len(input_ids) == len(loss_mask) == len(target_ids), (
+                f"input_ids, loss_mask and target_ids must have the same length, but got {len(input_ids)=}, {len(loss_mask)=}, {len(target_ids)=}"
+            )
+            assert sum(loss_mask) > 0, "There are no tokens in this sample that contribute to the loss"
+            assert self.tokenizer.eos_token_id in target_ids, "EOS token ID must be present in target_ids"
+
+            # Create sample
+            return {
+                "input_ids": input_ids,
+                "target_ids": target_ids,
+                "loss_mask": loss_mask,
+                "position_ids": list(range(len(input_ids))),
+            }
+
+        elif self.format == "prompt_completion":
+            # Assert that the example has a 'prompt' and 'completion' column
+            if "prompt" not in example or "completion" not in example:
+                raise ValueError("All examples in the dataset must have a 'prompt' and 'completion' column for SFT with format='prompt_completion'")
+            prompt_messages = example["prompt"]
+            completion_messages = example["completion"]
+        elif self.format == "messages":
+            # Assert that the example has a 'messages' column
+            if "messages" not in example:
+                raise ValueError("All examples in the dataset must have a 'messages' column for SFT with format='messages'")
+
+            # Split messages into prompt and completion based on roles
+            # Typically, the last assistant message(s) are the completion
+            messages = example["messages"]
+
+            # Find the last assistant message index
+            last_assistant_idx = None
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "assistant":
+                    last_assistant_idx = i
+                    break
+
+            if last_assistant_idx is None:
+                self.logger.warning(f"Skipping example {example.get('__index', '')} because no assistant message found in messages format")
+                return None
+
+            # Split at the last assistant message
+            # Everything before is prompt, last assistant message onwards is completion
+            prompt_messages = messages[:last_assistant_idx]
+            completion_messages = messages[last_assistant_idx:]
+        else:
+            raise ValueError(f"Invalid format: {self.format}")
 
         def deserialize_tool_calls(messages: list[dict]) -> list[dict]:
             """
@@ -197,8 +347,8 @@ class SFTDataset(StatefulIterableDataset):
 
         # Deserialize tool call arguments from message list, if present - assumes OAI format
         # Reference: https://platform.openai.com/docs/guides/function-calling#handling-function-calls
-        prompt = deserialize_tool_calls(example["prompt"])
-        completion = deserialize_tool_calls(example["completion"])
+        prompt = deserialize_tool_calls(prompt_messages)
+        completion = deserialize_tool_calls(completion_messages)
 
         # Strip content from all messages so that incremental tokenization works
         # NOTE: This has the side effect that we do never train on leading or trailing whitespace
@@ -591,6 +741,7 @@ def setup_dataset(
             seq_len=config.seq_len,
             loss_mask_config=config.loss_mask,
             non_dp_size=non_dp_size,
+            format=config.format,
         )
     else:
         raise ValueError(f"Invalid dataset type: {config.type}")
